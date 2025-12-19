@@ -2,30 +2,37 @@ import express from "express";
 import line from "@line/bot-sdk";
 
 const app = express();
-
-// Render 會提供 PORT
 const PORT = process.env.PORT || 3000;
 
-// 你要在 Render 設定這兩個環境變數
+// LINE 設定（從 Render 的 Environment Variables 讀）
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
+// 基本檢查（避免沒設變數還一直 timeout）
 if (!config.channelAccessToken || !config.channelSecret) {
-  console.warn("Missing LINE env vars. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.");
+  console.error("❌ Missing LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
 }
 
+// LINE Client
 const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-// 讓 LINE Verify（GET）也能拿到 200
+// ====== 基本健康檢查（給 Render / 瀏覽器用） ======
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
+// ====== 工具：解析訂單文字 ======
 function parseOrderText(text) {
+  // 支援：
+  // 逆水寒 2500*10 170*5 240*1
+  // 或
+  // 逆水寒
+  // 2500*10 170*5 240*1
   const lines = text.trim().split(/\n+/).map(s => s.trim()).filter(Boolean);
+
   let game = "";
   let rawItems = "";
 
@@ -43,6 +50,7 @@ function parseOrderText(text) {
 
   const items = [];
   let total = 0;
+
   for (const p of pairs) {
     const m = p.replace(/\s+/g, "").match(/^(\d+)[*xX](\d+)$/);
     if (!m) continue;
@@ -52,9 +60,9 @@ function parseOrderText(text) {
     total += sub;
     items.push({ amount, qty, sub });
   }
-  if (items.length === 0) return null;
 
-  return { game, raw: rawItems, items, total };
+  if (items.length === 0) return null;
+  return { game, items, total };
 }
 
 function makeOrderId(game) {
@@ -70,116 +78,4 @@ function itemsText(items) {
   return items.map(it => `${it.amount}×${it.qty}=${it.sub}`).join("、");
 }
 
-function flexPaymentCard({ game, items, total, orderId }) {
-  return {
-    type: "flex",
-    altText: "付款確認",
-    contents: {
-      type: "bubble",
-      size: "mega",
-      body: {
-        type: "box",
-        layout: "vertical",
-        spacing: "md",
-        contents: [
-          { type: "text", text: "🧾 付款確認", weight: "bold", size: "xl" },
-          { type: "text", text: "請確認金額無誤後再匯款", size: "sm", wrap: true },
-          { type: "separator", margin: "md" },
-          {
-            type: "box",
-            layout: "vertical",
-            spacing: "sm",
-            margin: "md",
-            contents: [
-              { type: "text", text: `遊戲：${game}`, wrap: true },
-              { type: "text", text: `明細：${itemsText(items)}`, wrap: true },
-              { type: "text", text: `應付總額：${total}`, weight: "bold", size: "lg", wrap: true },
-              { type: "text", text: `訂單編號：${orderId}`, size: "sm", wrap: true, color: "#666666" }
-            ]
-          },
-          { type: "text", text: "⚠️ 未收到款項前不會進行儲值", size: "xs", wrap: true, color: "#888888", margin: "md" }
-        ]
-      },
-      footer: {
-        type: "box",
-        layout: "vertical",
-        spacing: "sm",
-        contents: [
-          {
-            type: "button",
-            style: "primary",
-            action: { type: "postback", label: "💰 我已付款", data: `action=paid&orderId=${orderId}` }
-          },
-          {
-            type: "button",
-            style: "secondary",
-            action: { type: "postback", label: "🔢 回傳帳號末五碼", data: `action=last5&orderId=${orderId}` }
-          }
-        ]
-      }
-    }
-  };
-}
-
-// LINE webhook（POST）一定要 200 快速回
-app.post(
-  "/webhook",
-  express.json({ verify: line.middleware(config) }),
-  async (req, res) => {
-    // 先立刻回 200，避免 timeout
-    res.sendStatus(200);
-
-    try {
-      const events = req.body.events || [];
-      for (const ev of events) {
-        // 文字訊息：解析成訂單→回確認卡
-        if (ev.type === "message" && ev.message?.type === "text") {
-          const text = (ev.message.text || "").trim();
-          const parsed = parseOrderText(text);
-
-          if (!parsed) {
-            await client.replyMessage({
-              replyToken: ev.replyToken,
-              messages: [
-                {
-                  type: "text",
-                  text:
-                    "我看不太懂格式～請用：\n遊戲名 + 空格 + 面額*數量（可多組）\n例：逆水寒 2500*10 170*5 240*1",
-                },
-              ],
-            });
-            continue;
-          }
-
-          const orderId = makeOrderId(parsed.game);
-
-          await client.replyMessage({
-            replyToken: ev.replyToken,
-            messages: [flexPaymentCard({ ...parsed, orderId })],
-          });
-          continue;
-        }
-
-        // 按鈕 postback：先回提示（先做 MVP，不做記帳）
-        if (ev.type === "postback") {
-          const data = ev.postback?.data || "";
-          if (data.includes("action=paid")) {
-            await client.replyMessage({
-              replyToken: ev.replyToken,
-              messages: [{ type: "text", text: "收到～請回覆帳號末五碼（5位數字），例如：12345" }],
-            });
-          } else if (data.includes("action=last5")) {
-            await client.replyMessage({
-              replyToken: ev.replyToken,
-              messages: [{ type: "text", text: "請直接輸入 5 位數字末五碼（例如：12345）" }],
-            });
-          }
-        }
-      }
-    } catch (err) {
-      console.error("Webhook handler error:", err);
-    }
-  }
-);
-
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+//
